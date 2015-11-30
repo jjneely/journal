@@ -1,6 +1,6 @@
 // Package locking provides simple Flock based file locking utilities
 // designed for synchronization around files on a single system.
-package locking
+package lock
 
 import (
 	"os"
