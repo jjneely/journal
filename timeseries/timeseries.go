@@ -224,6 +224,7 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 	}
 
 	if epoch == 0 {
+		fmt.Printf("First write...\n")
 		binary.LittleEndian.PutUint64(buf, uint64(timestamp))
 		_, err = ts.fd.WriteAt(buf, HeaderSize-8) // location of epoch
 		if err != nil {
@@ -231,8 +232,9 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 		}
 
 		// update the header struct, which should now no longer change
-		ts.header.Epoch = epoch
+		ts.header.Epoch = timestamp
 	}
+	fmt.Printf("Epoch = %d\n", ts.header.Epoch)
 
 	// Calculate offset
 	stat, err := ts.fd.Stat()
@@ -240,6 +242,7 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 		return err
 	}
 	offsetBytes := ((timestamp - ts.header.Epoch) / ts.header.Interval) * ts.header.Width
+	fmt.Printf("Offset bytes = %d + HeaderSize\n", offsetBytes)
 
 	// Write to the file
 	if offsetBytes < 0 {
