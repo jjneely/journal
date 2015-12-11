@@ -33,13 +33,24 @@ func TestFileCreateOpen(t *testing.T) {
 	j.Close()
 }
 
+func checkSize(t *testing.T, j *FileJournal) {
+	stat, err := j.fd.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stat.Size() != HeaderSize+j.points*j.Width() {
+		t.Errorf("Produced file does not have the right size: %d != %d",
+			stat.Size(), HeaderSize+j.points*j.Width())
+	}
+}
+
 func TestReadWrite(t *testing.T) {
 	epoch := int64(1449240543)
 	meta := make([]int64, 4)
 	fillInt64(meta)
 	j, err := Create("/tmp/test-readwrite.tsj", 8, 60, meta)
 	if err != nil {
-		t.Fatalf("Error creating ts journam: %s", err)
+		t.Fatalf("Error creating ts journal: %s", err)
 	}
 	defer j.Close()
 
@@ -56,14 +67,34 @@ func TestReadWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error writing to ts journal: %s", err)
 	}
-	t.Logf("Data written: %v", values)
-	stat, err := j.fd.Stat()
+	t.Logf("Random values: %v", values)
+	checkSize(t, j)
+
+	// 2nd write that requires a null gap
+	epoch2 := epoch + (20 * 60) // 20 time units in the future
+	err = j.Write(epoch2, buf.Bytes(), nullValue)
+	if err != nil {
+		t.Fatalf("Error writing to journal with gap: %s", err)
+	}
+	checkSize(t, j)
+	if j.points != 30 {
+		// There should now be 30 data points in the journal
+		t.Fatalf("Journal should have 30 data points not %d", j.points)
+	}
+
+	// Re-open
+	j.Close()
+	j, err = Open("/tmp/test-readwrite.tsj")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stat.Size() != HeaderSize+10*j.Width() {
-		t.Fatalf("Produced file does not have the right size: %d != %d",
-			stat.Size(), HeaderSize+10*j.Width())
+	if j.points != 30 {
+		t.Errorf("Re-open does not see the correct number of data points: %d != %d",
+			j.points, 30)
+	}
+	if j.header.Epoch != adjust(1449240543, 60) {
+		t.Errorf("Re-open does not see the correct Epoch value: %d != %d",
+			j.header.Epoch, adjust(1449240543, 60))
 	}
 }
 

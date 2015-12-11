@@ -69,6 +69,7 @@ type FileJournal struct {
 	header   FileHeader
 	fd       *os.File
 	readonly bool
+	points   int64
 }
 
 // FileHeader represents the header information stored at the front of
@@ -101,12 +102,15 @@ func Open(path string) (*FileJournal, error) {
 		return nil, err
 	}
 
-	err = lock.Share(fd)
+	if readonly {
+		err = lock.Share(fd)
+	} else {
+		err = lock.Exclusive(fd)
+	}
 	if err != nil {
 		fd.Close()
 		return nil, err
 	}
-	defer lock.Release(fd)
 
 	j := FileJournal{}
 	j.fd = fd
@@ -122,6 +126,18 @@ func Open(path string) (*FileJournal, error) {
 		return nil, fmt.Errorf("Not a journal timeseries: %s", path)
 	}
 
+	// How large are we?
+	stat, err := j.fd.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	if (stat.Size()-HeaderSize)%j.header.Width != 0 {
+		// XXX: How can we recover from a partial Write()?
+		return nil, fmt.Errorf("Corrupt or partial data!")
+	}
+
+	j.points = (stat.Size() - HeaderSize) / j.header.Width
 	return &j, nil
 }
 
@@ -161,7 +177,6 @@ func Create(path string, width, interval int64, meta []int64) (*FileJournal, err
 		fd.Close()
 		return nil, err
 	}
-	defer lock.Release(fd)
 
 	// Allocate and fill in our structs
 	j := FileJournal{
@@ -174,6 +189,7 @@ func Create(path string, width, interval int64, meta []int64) (*FileJournal, err
 		},
 		fd:       fd,
 		readonly: false,
+		points:   0,
 	}
 	copy(j.header.Meta[:], meta)
 
@@ -191,11 +207,18 @@ func adjust(timestamp, interval int64) int64 {
 	return timestamp - (timestamp % interval)
 }
 
+func offset(ts *FileJournal, timestamp int64) int64 {
+	timestamp = adjust(timestamp, ts.header.Interval)
+	return ((timestamp - ts.header.Epoch) / ts.header.Interval) * ts.header.Width
+}
+
 // Write seeks to the given Unix timestamp and writes the contents
 // of the given []byte slice to the journal, extending the file length
 // on disk if needed.  Multiple values may be written by providing
 // them in the given byte slice.  They must be for sequential timestamps.
 func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
+	var err error
+
 	// Sanity Check
 	if int64(len(values))%ts.header.Width != 0 {
 		return fmt.Errorf("Buffer length not a multiple of width")
@@ -204,73 +227,59 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 		return fmt.Errorf("Given null value must be width bytes long")
 	}
 	timestamp = adjust(timestamp, ts.header.Interval)
+	seekPoint := (timestamp - ts.header.Epoch) / ts.header.Interval
+	addedPoints := int64(len(values)) / ts.header.Width
+	buffer := make([]byte, 0)
+	seek := int64(0)
 
-	// Lock the file
-	err := lock.Exclusive(ts.fd)
-	if err != nil {
-		return err
-	}
-	defer lock.Release(ts.fd)
-
-	// if Epoch is 0, we need to check that's till the case
-	epoch := int64(0)
-	buf := make([]byte, 8)
 	if ts.header.Epoch == 0 {
-		_, err = ts.fd.ReadAt(buf, HeaderSize-8) // location of epoch in file
-		if err != nil {
-			return err
-		}
-		epoch = int64(binary.LittleEndian.Uint64(buf))
-	}
-
-	if epoch == 0 {
-		fmt.Printf("First write...\n")
+		// First write, we must write the epoch
+		seek = HeaderSize - 8
+		buf := make([]byte, 8)
 		binary.LittleEndian.PutUint64(buf, uint64(timestamp))
-		_, err = ts.fd.WriteAt(buf, HeaderSize-8) // location of epoch
-		if err != nil {
-			return err
+		buffer = append(buffer, buf...)
+	} else if seekPoint <= ts.points {
+		// a "normal" write
+		seek = HeaderSize + (seekPoint * ts.header.Width)
+		addedPoints = ts.points - seekPoint + addedPoints
+	} else if seekPoint > ts.points {
+		// a "gap" write
+		gapPoints := seekPoint - ts.points
+		for i := int64(0); i < gapPoints; i++ {
+			buffer = append(buffer, null...)
 		}
-
-		// update the header struct, which should now no longer change
-		ts.header.Epoch = timestamp
-	}
-	fmt.Printf("Epoch = %d\n", ts.header.Epoch)
-
-	// Calculate offset
-	stat, err := ts.fd.Stat()
-	if err != nil {
-		return err
-	}
-	offsetBytes := ((timestamp - ts.header.Epoch) / ts.header.Interval) * ts.header.Width
-	fmt.Printf("Offset bytes = %d + HeaderSize\n", offsetBytes)
-
-	// Write to the file
-	if offsetBytes < 0 {
-		// XXX: Handle this case, this is most likely a file re-write
-		// and is anticipated to be a rare event
+		addedPoints = addedPoints + gapPoints
+		seek = HeaderSize + (ts.points * ts.header.Width)
+	} else {
+		// XXX: Timestamp is before journal epoch
 		return fmt.Errorf("Time stamp is before journal epoch")
 	}
-	if offsetBytes > stat.Size()-HeaderSize {
-		// We need to fill in a gap of null data between the end of file
-		// and where our data starts
-		gapBytes := offsetBytes - stat.Size() - HeaderSize
-		buf = make([]byte, gapBytes)
-		for i := int64(0); i < gapBytes; i = i + ts.header.Width {
-			copy(buf[i:i+ts.header.Width], null)
-		}
-		buf = append(buf, values...)
 
-		_, err = ts.fd.WriteAt(buf, stat.Size())
-	} else {
-		// We are writing at the end of the file (normal) or somewhere in
-		// the middle of the file (allowed)
-		_, err = ts.fd.WriteAt(values, offsetBytes+HeaderSize)
-	}
+	// Make one Write() call
+	buffer = append(buffer, values...)
+	_, err = ts.fd.WriteAt(buffer, seek) // XXX: Deal with partial writes
 	if err != nil {
 		return err
+	}
+
+	// Book keeping
+	ts.points = ts.points + addedPoints
+	if ts.header.Epoch == 0 {
+		ts.header.Epoch = timestamp
 	}
 
 	return nil
+}
+
+func (ts *FileJournal) Read(timestamp int64, values []byte) (int, error) {
+	// Sanity Check
+	if int64(len(values))%ts.header.Width != 0 {
+		return 0, fmt.Errorf("Buffer length not a multiple of width")
+	}
+
+	offsetBytes := offset(ts, timestamp) // This adjusts the timestamp
+	n, err := ts.fd.ReadAt(values, offsetBytes+HeaderSize)
+	return n / int(ts.header.Width), err
 }
 
 // Close will close the underlying file.  Future read/write operations will
