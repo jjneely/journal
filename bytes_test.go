@@ -23,6 +23,9 @@ func TestByteValues(t *testing.T) {
 		t.Errorf("Bytes factory width is %d and should be %d", factory.Width(),
 			2)
 	}
+	if factory.Type() != 0x0F {
+		t.Errorf("Type encoding should be 0x0F but was %x", factory.Type())
+	}
 	if !bytes.Equal(factory.Null(), []byte("--")) {
 		t.Errorf("Bytes factory null value is %v but should be %v",
 			factory.Null(), []byte("--"))

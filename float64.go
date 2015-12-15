@@ -20,8 +20,13 @@ func NewFloat64ValueType() *Float64ValueType {
 }
 
 // Width is always 8 bytes for Float64 values.
-func (t *Float64ValueType) Width() int64 {
+func (t *Float64ValueType) Width() int32 {
 	return 8
+}
+
+// Type returns the type encoding as stored on disk
+func (t *Float64ValueType) Type() int32 {
+	return 0x10
 }
 
 // Null returns the 8 byte encoding of the IEEE floating point NaN.
@@ -38,7 +43,7 @@ func (t *Float64ValueType) Null() []byte {
 // Decode takes a byte slice presumably read from disk and decodes into
 // a slice of float64 using Little Endian encoding.
 func (t *Float64ValueType) Decode(buffer []byte) Values {
-	floats := make([]float64, int64(len(buffer))/t.Width())
+	floats := make([]float64, int32(len(buffer))/t.Width())
 	buf := bytes.NewBuffer(buffer)
 	err := binary.Read(buf, binary.LittleEndian, floats)
 	if err != nil {
@@ -59,4 +64,9 @@ func (v Float64Values) Encode() []byte {
 		return nil
 	}
 	return buf.Bytes()
+}
+
+// Len returns the length of the float64 slice.
+func (v Float64Values) Len() int {
+	return len(v)
 }

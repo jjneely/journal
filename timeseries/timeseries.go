@@ -8,6 +8,7 @@ import (
 )
 
 import (
+	. "github.com/jjneely/journal"
 	"github.com/jjneely/journal/lock"
 )
 
@@ -19,7 +20,7 @@ type Journal interface {
 	// Width returns the number of bytes each value stored in the file
 	// uses.  A float64 value uses 8 bytes.  The journal can only store
 	// repeated values of the same type and byte width
-	Width() int64
+	Width() int32
 
 	// Interval returns the number of time units (usually seconds) between
 	// each value.
@@ -35,13 +36,13 @@ type Journal interface {
 	// This returns the number of bytes read and any error that occurred.
 	// To return a list of values starting at timestamp provide a slice
 	// with length of Width() * # values.
-	Read(timestamp int64, buf []byte) (int, error)
+	Read(timestamp int64, n int) (Values, error)
 
 	// Write seeks to the given Unix timestamp and writes the contents
 	// of the given []byte slice to the journal, extending the file length
 	// on disk if needed.  Multiple values may be written by providing
 	// them in the given byte slice.  They must be for sequential timestamps.
-	Write(timestamp int64, buf []byte) error
+	Write(timestamp int64, values Values) error
 
 	// Last returns the Unix timestamp that matches the most recent
 	// value recorded in the journal.  This is the last entry in the file.
@@ -70,6 +71,7 @@ type FileJournal struct {
 	fd       *os.File
 	readonly bool
 	points   int64
+	factory  ValueType
 }
 
 // FileHeader represents the header information stored at the front of
@@ -77,7 +79,8 @@ type FileJournal struct {
 type FileHeader struct {
 	Magic    [4]byte  // magic number: 4 bytes
 	Version  int32    // version: 4 bytes
-	Width    int64    // width: 8 bytes
+	Type     int32    // type code: 4 bytes
+	Width    int32    // width: 4 bytes
 	Interval int64    // interval: 8 bytes
 	Meta     [4]int64 // meta: 4 x 8 bytes
 	Epoch    int64    // epoch is last in the header, and 8 bytes
@@ -126,28 +129,31 @@ func Open(path string) (*FileJournal, error) {
 		return nil, fmt.Errorf("Not a journal timeseries: %s", path)
 	}
 
+	// Type factory
+	j.factory = GetValueType(j.header.Type, j.header.Width)
+
 	// How large are we?
 	stat, err := j.fd.Stat()
 	if err != nil {
 		return nil, err
 	}
 
-	if (stat.Size()-HeaderSize)%j.header.Width != 0 {
+	if (stat.Size()-HeaderSize)%int64(j.header.Width) != 0 {
 		// XXX: How can we recover from a partial Write()?
 		return nil, fmt.Errorf("Corrupt or partial data!")
 	}
 
-	j.points = (stat.Size() - HeaderSize) / j.header.Width
+	j.points = (stat.Size() - HeaderSize) / int64(j.header.Width)
 	return &j, nil
 }
 
 // Create attempts to create a FileJournal at the given path, creating
-// any subdirectories needed by the path.  The width of the data type
-// that will be stored must be given.  A float64 is 8 bytes.  The
+// any subdirectories needed by the path.  An implementation of ValueType
+// must be given that defines the type of data to be stored.  The
 // time units between each data point must also be given.  For a time
 // series file that records data points every 60 seconds must have interval
 // set to 60.  The meta parameter is a value defined by the application.
-func Create(path string, width, interval int64, meta []int64) (*FileJournal, error) {
+func Create(path string, interval int64, factory ValueType, meta []int64) (*FileJournal, error) {
 	// Create the base directory, if needed
 	dir := filepath.Dir(path)
 	dirInfo, err := os.Stat(dir)
@@ -183,13 +189,15 @@ func Create(path string, width, interval int64, meta []int64) (*FileJournal, err
 		header: FileHeader{
 			Magic:    Magic,
 			Version:  Version,
-			Width:    width,
+			Type:     factory.Type(),
+			Width:    factory.Width(),
 			Interval: interval,
 			Epoch:    0,
 		},
 		fd:       fd,
 		readonly: false,
 		points:   0,
+		factory:  factory,
 	}
 	copy(j.header.Meta[:], meta)
 
@@ -209,26 +217,18 @@ func adjust(timestamp, interval int64) int64 {
 
 func offset(ts *FileJournal, timestamp int64) int64 {
 	timestamp = adjust(timestamp, ts.header.Interval)
-	return ((timestamp - ts.header.Epoch) / ts.header.Interval) * ts.header.Width
+	return ((timestamp - ts.header.Epoch) / ts.header.Interval) * int64(ts.header.Width)
 }
 
 // Write seeks to the given Unix timestamp and writes the contents
 // of the given []byte slice to the journal, extending the file length
 // on disk if needed.  Multiple values may be written by providing
 // them in the given byte slice.  They must be for sequential timestamps.
-func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
+func (ts *FileJournal) Write(timestamp int64, values Values) error {
 	var err error
-
-	// Sanity Check
-	if int64(len(values))%ts.header.Width != 0 {
-		return fmt.Errorf("Buffer length not a multiple of width")
-	}
-	if int64(len(null)) != ts.header.Width {
-		return fmt.Errorf("Given null value must be width bytes long")
-	}
 	timestamp = adjust(timestamp, ts.header.Interval)
 	seekPoint := (timestamp - ts.header.Epoch) / ts.header.Interval
-	addedPoints := int64(len(values)) / ts.header.Width
+	addedPoints := int64(values.Len())
 	buffer := make([]byte, 0)
 	seek := int64(0)
 
@@ -240,23 +240,27 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 		buffer = append(buffer, buf...)
 	} else if seekPoint <= ts.points {
 		// a "normal" write
-		seek = HeaderSize + (seekPoint * ts.header.Width)
-		addedPoints = ts.points - seekPoint + addedPoints
+		seek = HeaderSize + (seekPoint * int64(ts.header.Width))
+		if addedPoints < ts.points-seekPoint {
+			addedPoints = 0
+		} else {
+			addedPoints = addedPoints - (ts.points - seekPoint)
+		}
 	} else if seekPoint > ts.points {
 		// a "gap" write
 		gapPoints := seekPoint - ts.points
 		for i := int64(0); i < gapPoints; i++ {
-			buffer = append(buffer, null...)
+			buffer = append(buffer, ts.factory.Null()...)
 		}
 		addedPoints = addedPoints + gapPoints
-		seek = HeaderSize + (ts.points * ts.header.Width)
+		seek = HeaderSize + (ts.points * int64(ts.header.Width))
 	} else {
 		// XXX: Timestamp is before journal epoch
 		return fmt.Errorf("Time stamp is before journal epoch")
 	}
 
 	// Make one Write() call
-	buffer = append(buffer, values...)
+	buffer = append(buffer, values.Encode()...)
 	_, err = ts.fd.WriteAt(buffer, seek) // XXX: Deal with partial writes
 	if err != nil {
 		return err
@@ -271,15 +275,11 @@ func (ts *FileJournal) Write(timestamp int64, values, null []byte) error {
 	return nil
 }
 
-func (ts *FileJournal) Read(timestamp int64, values []byte) (int, error) {
-	// Sanity Check
-	if int64(len(values))%ts.header.Width != 0 {
-		return 0, fmt.Errorf("Buffer length not a multiple of width")
-	}
-
+func (ts *FileJournal) Read(timestamp int64, n int) (Values, error) {
+	buf := make([]byte, int64(n)*int64(ts.header.Width))
 	offsetBytes := offset(ts, timestamp) // This adjusts the timestamp
-	n, err := ts.fd.ReadAt(values, offsetBytes+HeaderSize)
-	return n / int(ts.header.Width), err
+	n, err := ts.fd.ReadAt(buf, offsetBytes+HeaderSize)
+	return ts.factory.Decode(buf[:n]), err
 }
 
 // Close will close the underlying file.  Future read/write operations will
@@ -307,7 +307,7 @@ func (ts *FileJournal) Meta() []int64 {
 
 // Width returns the width of the data values stored in the time series
 // journal in bytes.  This is specified at creation time.
-func (ts *FileJournal) Width() int64 {
+func (ts *FileJournal) Width() int32 {
 	return ts.header.Width
 }
 
@@ -316,4 +316,10 @@ func (ts *FileJournal) Width() int64 {
 // function returns 60.
 func (ts *FileJournal) Interval() int64 {
 	return ts.header.Interval
+}
+
+// Last returns the most recent timestamp with a corresponding value in this
+// journal.
+func (ts *FileJournal) Last() int64 {
+	return ts.header.Epoch + (ts.header.Interval * (ts.points - 1))
 }

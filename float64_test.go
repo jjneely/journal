@@ -13,6 +13,11 @@ func TestFloat64Values(t *testing.T) {
 	values := Float64Values(data)
 	raw := values.Encode()
 
+	if values.Len() != len(data) {
+		t.Fatalf("Length of values is %d and does not match the length of data",
+			values.Len())
+	}
+
 	// my decode
 	buf := new(bytes.Buffer)
 	null := new(bytes.Buffer)
@@ -27,6 +32,9 @@ func TestFloat64Values(t *testing.T) {
 	if factory.Width() != 8 {
 		t.Errorf("Bytes factory width is %d and should be %d", factory.Width(),
 			8)
+	}
+	if factory.Type() != 0x10 {
+		t.Errorf("Type encoding should always me 0x10 but was %x", factory.Type())
 	}
 	if !bytes.Equal(factory.Null(), null.Bytes()) {
 		t.Errorf("Bytes factory null value is %v but should be %v",
