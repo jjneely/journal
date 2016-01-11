@@ -158,7 +158,7 @@ func Create(path string, interval int64, factory ValueType, meta []int64) (*File
 	dir := filepath.Dir(path)
 	dirInfo, err := os.Stat(dir)
 	if os.IsNotExist(err) {
-		err2 := os.MkdirAll(dir, 0666)
+		err2 := os.MkdirAll(dir, 0777)
 		if err2 != nil {
 			return nil, err
 		}
@@ -276,6 +276,15 @@ func (ts *FileJournal) Write(timestamp int64, values Values) error {
 }
 
 func (ts *FileJournal) Read(timestamp int64, n int) (Values, error) {
+	// Sanity check out inputs
+	if timestamp < ts.header.Epoch {
+		timestamp = ts.header.Epoch
+	}
+	// XXX 64 bit archs only
+	if n > int(ts.points) {
+		n = int(ts.points)
+	}
+
 	buf := make([]byte, int64(n)*int64(ts.header.Width))
 	offsetBytes := offset(ts, timestamp) // This adjusts the timestamp
 	n, err := ts.fd.ReadAt(buf, offsetBytes+HeaderSize)
